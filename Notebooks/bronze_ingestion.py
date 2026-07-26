@@ -61,8 +61,10 @@ sources = [
 
 def get_s3_last_modified(s3_path: str) -> datetime:
     """Get the most recent modification time of files in an S3 path using dbutils."""
-    files = dbutils.fs.ls(s3_path)
-    latest_ms = max(f.modificationTime for f in files if f.size > 0)
+    files = [f for f in dbutils.fs.ls(s3_path) if f.size > 0]
+    if not files:
+        raise FileNotFoundError(f"No parquet files found in {s3_path} (folder is empty or contains only placeholders)")
+    latest_ms = max(f.modificationTime for f in files)
     return datetime.fromtimestamp(latest_ms / 1000, tz=timezone.utc)
 
 def get_last_ingestion(full_table: str) -> datetime | None:
