@@ -4,16 +4,17 @@
 # MAGIC ## Bronze Ingestion — wehoop WNBA Data
 # MAGIC
 # MAGIC ### Overview
-# MAGIC This notebook ingests raw WNBA data from an S3 bucket into the **bronze layer** of the `hooplakehouse.whoop` schema using **Auto Loader** (Structured Streaming with `cloudFiles` format). All sources are managed through a single config-driven loop to prevent configuration drift.
+# MAGIC This notebook ingests raw WNBA data from an S3 bucket into the **bronze layer** of the `hooplakehouse.whoop` schema using a **batch read + overwrite** pattern. All sources are managed through a single config-driven loop to prevent configuration drift.
 # MAGIC
 # MAGIC ### How it works
-# MAGIC * **Auto Loader** incrementally discovers and processes new parquet files from S3 using **directory listing mode** — no cloud notification infrastructure required.
-# MAGIC * **`trigger(availableNow=True)`** ensures the stream processes all new files and then stops, making it safe to run as a scheduled daily job.
-# MAGIC * **`.awaitTermination()`** guarantees each stream completes before the next starts (sequential execution).
-# MAGIC * **`mergeSchema=True`** handles schema evolution across files (e.g., new columns added over seasons).
+# MAGIC * **Batch read** reads all parquet files from each S3 source path.
+# MAGIC * **`mode("overwrite")`** fully replaces the bronze table each run, ensuring it always reflects the latest state of the source files (which are overwritten upstream daily).
+# MAGIC * **`overwriteSchema=True`** handles schema evolution across files (e.g., new columns added over seasons).
 # MAGIC * **Ingestion metadata** is added to every row: `_ingestion_timestamp` and `_load_date`.
-# MAGIC * A **`_rescued_data`** column captures any values that don't conform to the inferred schema (e.g., type mismatches between older and newer files). This is intentionally kept at bronze and handled in the silver layer.
-# MAGIC * **Checkpoints** track which files have already been processed, so re-running only picks up new data.
+# MAGIC * **No checkpoints needed** — since the upstream overwrites the same files, we do a full refresh each run.
+# MAGIC
+# MAGIC ### Why not Auto Loader?
+# MAGIC Auto Loader is optimized for **append-only** file sources (new files arriving). Our upstream regenerates the same parquet files daily with updated data, so a batch overwrite is simpler and guarantees we always have the latest state.
 # MAGIC
 # MAGIC ### Source → Target Mapping
 # MAGIC
@@ -44,43 +45,87 @@ folder = "wehoop-wnba-data"
 
 # COMMAND ----------
 
+# DBTITLE 1,Drop all bronze tables
+tables = ["bronze_pbp", "bronze_player_box", "bronze_player_season_stats", "bronze_schedules", "bronze_team_box"]
+
+for table in tables:
+    spark.sql(f"DROP TABLE IF EXISTS hooplakehouse.whoop.{table}")
+    print(f"Dropped hooplakehouse.whoop.{table}")
+
+# COMMAND ----------
+
 # DBTITLE 1,Auto Loader - Ingest all bronze sources
-# Source configuration: (subfolder, target_table)
+from datetime import datetime, timezone
+from pyspark.sql.functions import max as spark_max
+
+# Source configuration: (subfolder, target_table, schema_hints)
+# schema_hints: optional string to resolve type conflicts across parquet files
 sources = [
-    ("pbp", "bronze_pbp"),
-    ("player_box", "bronze_player_box"),
-    ("player_season_stats", "bronze_player_season_stats"),
-    ("schedules", "bronze_schedules"),
-    ("team_box", "bronze_team_box"),
+    ("pbp", "bronze_pbp", "id DOUBLE"),
+    ("player_box", "bronze_player_box", None),
+    ("player_season_stats", "bronze_player_season_stats", None),
+    ("schedules", "bronze_schedules", None),
+    ("team_box", "bronze_team_box", None),
 ]
 
-def ingest_to_bronze(source_subfolder: str, table_name: str):
-    """Run Auto Loader stream for a single source into the bronze layer."""
+def get_s3_last_modified(s3_path: str) -> datetime:
+    """Get the most recent modification time of files in an S3 path using dbutils."""
+    files = dbutils.fs.ls(s3_path)
+    latest_ms = max(f.modificationTime for f in files if f.size > 0)
+    return datetime.fromtimestamp(latest_ms / 1000, tz=timezone.utc)
+
+def get_last_ingestion(full_table: str) -> datetime | None:
+    """Get the last ingestion timestamp from the target table, or None if it doesn't exist."""
+    try:
+        result = spark.table(full_table).select(spark_max("_ingestion_timestamp")).collect()[0][0]
+        return result
+    except Exception:
+        return None
+
+def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str | None = None):
+    """Read parquet from S3 and overwrite the bronze table if source has changed."""
     s3_path = f"s3://{bucket_name}/{folder}/{source_subfolder}/parquet/"
-    checkpoint_path = f"/tmp/checkpoints/wehoop/{table_name}"
-    schema_path = f"{checkpoint_path}/_schema"
     full_table = f"hooplakehouse.whoop.{table_name}"
+
+    # Check if source files have been modified since last ingestion
+    s3_modified = get_s3_last_modified(s3_path)
+    last_ingestion = get_last_ingestion(full_table)
+
+    if last_ingestion and s3_modified <= last_ingestion.replace(tzinfo=timezone.utc):
+        print(f"⏭ Skipping {full_table} — source unchanged (last modified: {s3_modified})")
+        return
 
     print(f"Ingesting: {s3_path} → {full_table}")
 
+    # Use read_files() with schemaHints when type conflicts exist, otherwise standard read
+    if schema_hints:
+        df = spark.sql(f"""
+            SELECT * FROM read_files(
+                '{s3_path}',
+                format => 'parquet',
+                schemaHints => '{schema_hints}'
+            )
+        """)
+    else:
+        df = spark.read.option("mergeSchema", "true").parquet(s3_path)
+
     (
-        spark.readStream
-        .format("cloudFiles")
-        .option("cloudFiles.format", "parquet")
-        .option("cloudFiles.useNotifications", "false")
-        .option("cloudFiles.schemaLocation", schema_path)
-        .load(s3_path)
-        .withColumn("_ingestion_timestamp", current_timestamp())
-        .withColumn("_load_date", current_date())
-        .writeStream
-        .option("checkpointLocation", checkpoint_path)
-        .option("mergeSchema", "true")
-        .trigger(availableNow=True)
-        .toTable(full_table)
-    ).awaitTermination()
+        df.withColumns({
+            "_ingestion_timestamp": current_timestamp(),
+            "_load_date": current_date()
+        })
+        .write
+        .mode("overwrite")
+        .option("overwriteSchema", "true")
+        .saveAsTable(full_table)
+    )
 
     print(f"  ✓ {full_table} complete")
 
 # Run all ingestions sequentially
-for source_subfolder, table_name in sources:
-    ingest_to_bronze(source_subfolder, table_name)
+for source_subfolder, table_name, schema_hints in sources:
+    ingest_to_bronze(source_subfolder, table_name, schema_hints)
+
+# COMMAND ----------
+
+
