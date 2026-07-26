@@ -45,15 +45,6 @@ folder = "wehoop-wnba-data"
 
 # COMMAND ----------
 
-# DBTITLE 1,Drop all bronze tables
-tables = ["bronze_pbp", "bronze_player_box", "bronze_player_season_stats", "bronze_schedules", "bronze_team_box"]
-
-for table in tables:
-    spark.sql(f"DROP TABLE IF EXISTS hooplakehouse.whoop.{table}")
-    print(f"Dropped hooplakehouse.whoop.{table}")
-
-# COMMAND ----------
-
 # DBTITLE 1,Auto Loader - Ingest all bronze sources
 from datetime import datetime, timezone
 from pyspark.sql.functions import max as spark_max, coalesce, col, get_json_object
