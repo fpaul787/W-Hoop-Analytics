@@ -56,7 +56,7 @@ for table in tables:
 
 # DBTITLE 1,Auto Loader - Ingest all bronze sources
 from datetime import datetime, timezone
-from pyspark.sql.functions import max as spark_max
+from pyspark.sql.functions import max as spark_max, coalesce, col, get_json_object
 
 # Source configuration: (subfolder, target_table, schema_hints)
 # schema_hints: optional string to resolve type conflicts across parquet files
@@ -92,7 +92,7 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
     last_ingestion = get_last_ingestion(full_table)
 
     if last_ingestion and s3_modified <= last_ingestion.replace(tzinfo=timezone.utc):
-        print(f"⏭ Skipping {full_table} — source unchanged (last modified: {s3_modified})")
+        print(f"Skipping {full_table} — source unchanged (last modified: {s3_modified})")
         return
 
     print(f"Ingesting: {s3_path} → {full_table}")
@@ -106,6 +106,18 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
                 schemaHints => '{schema_hints}'
             )
         """)
+        # Recover rescued values caused by type mismatches across files
+        for hint in schema_hints.split(","):
+            parts = hint.strip().split()
+            col_name, col_type = parts[0], parts[1]
+            df = df.withColumn(
+                col_name,
+                coalesce(
+                    col(col_name),
+                    get_json_object(col("_rescued_data"), f"$.{col_name}").cast(col_type)
+                )
+            )
+        df = df.drop("_rescued_data")
     else:
         df = spark.read.option("mergeSchema", "true").parquet(s3_path)
 
