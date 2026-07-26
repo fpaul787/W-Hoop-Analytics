@@ -45,7 +45,7 @@ folder = "wehoop-wnba-data"
 
 # COMMAND ----------
 
-# DBTITLE 1,Auto Loader - Ingest all bronze sources
+# DBTITLE 1,Ingest all bronze sources (batch overwrite)
 from datetime import datetime, timezone
 from pyspark.sql.functions import max as spark_max, coalesce, col, get_json_object
 
