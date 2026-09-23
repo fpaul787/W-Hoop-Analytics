@@ -45,7 +45,6 @@ folder = "wehoop-wnba-data"
 
 # COMMAND ----------
 
-# DBTITLE 1,Ingest all bronze sources (batch overwrite)
 from datetime import datetime, timezone
 from pyspark.sql.functions import max as spark_max, coalesce, col, get_json_object
 
@@ -59,6 +58,9 @@ sources = [
     ("team_box", "bronze_team_box", None),
 ]
 
+# COMMAND ----------
+
+# DBTITLE 1,Ingest all bronze sources (batch overwrite)
 def get_s3_last_modified(s3_path: str) -> datetime:
     """Get the most recent modification time of files in an S3 path using dbutils."""
     files = [f for f in dbutils.fs.ls(s3_path) if f.size > 0]
@@ -127,10 +129,8 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
 
     print(f"  ✓ {full_table} complete")
 
+# COMMAND ----------
+
 # Run all ingestions sequentially
 for source_subfolder, table_name, schema_hints in sources:
     ingest_to_bronze(source_subfolder, table_name, schema_hints)
-
-# COMMAND ----------
-
-
