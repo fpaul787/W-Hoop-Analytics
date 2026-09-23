@@ -30,6 +30,11 @@ bronze_play_by_play_df.printSchema()
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC # Schema Enforcement
+
+# COMMAND ----------
+
 from pyspark.sql.functions import col
 
 # id is double in bronze, so cast to long first to avoid scientific notation
@@ -51,6 +56,11 @@ display(silver_play_by_play)
 
 # COMMAND ----------
 
+# MAGIC %md
+# MAGIC # Data Quality & Validation
+
+# COMMAND ----------
+
 silver_play_by_play = (
     silver_play_by_play
     .filter(col("id").isNotNull())
@@ -58,4 +68,5 @@ silver_play_by_play = (
 
 # COMMAND ----------
 
-
+# DBTITLE 1,Deduplicate by id
+silver_play_by_play = silver_play_by_play.dropDuplicates(["id"])
