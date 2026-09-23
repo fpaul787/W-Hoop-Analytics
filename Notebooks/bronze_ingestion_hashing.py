@@ -111,8 +111,7 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
     else:
         df = spark.read.option("mergeSchema", "true").parquet(s3_path)
 
-    # SHA-256 hash over all business columns — the fingerprint that drives change detection.
-    # Rows with the same hash are unchanged; their timestamps will not be updated.
+    # SHA-256 hash
     business_cols = df.columns
     df = df.withColumns({
         "_row_hash": F.sha2(F.concat_ws("\x01", *[F.col(c).cast("string") for c in business_cols]), 256),
@@ -122,7 +121,8 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
 
     # First load or migration: table missing _row_hash → seed with a full overwrite
     table_exists = spark.catalog.tableExists(full_table)
-    needs_seed = not table_exists or "_row_hash" not in spark.table(full_table).columns
+    columns = [c.name for c in spark.catalog.listColumns(full_table)]
+    needs_seed = not table_exists or "_row_hash" not in columns
 
     if needs_seed:
         (df.write
@@ -143,8 +143,6 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
         .whenNotMatchedBySourceDelete()
         .execute()
     )
-
-    print(f"  ✓ {full_table} merge complete")
 
 # Run all ingestions sequentially
 for source_subfolder, table_name, schema_hints in sources:
