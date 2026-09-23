@@ -70,3 +70,8 @@ silver_play_by_play = (
 
 # DBTITLE 1,Deduplicate by id
 silver_play_by_play = silver_play_by_play.dropDuplicates(["id"])
+
+# COMMAND ----------
+
+# DBTITLE 1,Drop _row_hash column
+silver_play_by_play = silver_play_by_play.drop("_row_hash")
