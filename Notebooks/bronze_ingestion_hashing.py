@@ -45,11 +45,6 @@ folder = "wehoop-wnba-data"
 
 # COMMAND ----------
 
-# DBTITLE 1,Ingest all bronze sources (hash MERGE)
-from datetime import datetime, timezone
-from pyspark.sql import functions as F
-from delta.tables import DeltaTable
-
 # Source configuration: (subfolder, target_table, schema_hints)
 # schema_hints: optional string to resolve type conflicts across parquet files
 sources = [
@@ -57,8 +52,15 @@ sources = [
     ("player_box", "bronze_player_box", None),
     ("player_season_stats", "bronze_player_season_stats", None),
     ("schedules", "bronze_schedules", None),
-    ("team_box", "bronze_team_box", None),
+    ("team_box", "bronze_team_box", None)
 ]
+
+# COMMAND ----------
+
+# DBTITLE 1,Ingest all bronze sources (hash MERGE)
+from datetime import datetime, timezone
+from pyspark.sql import functions as F
+from delta.tables import DeltaTable
 
 def get_s3_last_modified(s3_path: str) -> datetime:
     """Get the most recent modification time of files in an S3 path using dbutils."""
@@ -74,7 +76,7 @@ def get_last_ingestion(full_table: str) -> datetime | None:
         return None
     return spark.table(full_table).select(F.max("_ingestion_timestamp")).collect()[0][0]
 
-def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str | None = None):
+def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str | None = None, force: bool = False):
     """Read parquet from S3 and merge into the bronze table, preserving timestamps for unchanged rows."""
     s3_path = f"s3://{bucket_name}/{folder}/{source_subfolder}/parquet/"
     full_table = f"hooplakehouse.whoop.{table_name}"
@@ -83,7 +85,7 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
     s3_modified = get_s3_last_modified(s3_path)
     last_ingestion = get_last_ingestion(full_table)
 
-    if last_ingestion and s3_modified <= last_ingestion.replace(tzinfo=timezone.utc):
+    if not force and last_ingestion and s3_modified <= last_ingestion.replace(tzinfo=timezone.utc):
         print(f"Skipping {full_table} — source unchanged (last modified: {s3_modified})")
         return
 
@@ -121,8 +123,7 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
 
     # First load or migration: table missing _row_hash → seed with a full overwrite
     table_exists = spark.catalog.tableExists(full_table)
-    columns = [c.name for c in spark.catalog.listColumns(full_table)]
-    needs_seed = not table_exists or "_row_hash" not in columns
+    needs_seed = not table_exists or "_row_hash" not in spark.table(full_table).columns  # listColumns() silently returns empty for UC 3-part names
 
     if needs_seed:
         (df.write
@@ -144,9 +145,122 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
         .execute()
     )
 
+    print(f"  ✓ {full_table} merge complete")
+
+
+# COMMAND ----------
+
 # Run all ingestions sequentially
 for source_subfolder, table_name, schema_hints in sources:
     ingest_to_bronze(source_subfolder, table_name, schema_hints)
+
+# COMMAND ----------
+
+# DBTITLE 1,Test: unchanged rows preserve timestamps
+# ── Test: verify unchanged rows keep their original timestamps ────────────────
+# Forces re-ingestion against the same source data and asserts that no
+# _ingestion_timestamp values were modified (all rows matched by _row_hash).
+
+TEST_SOURCE     = "schedules"
+TEST_TABLE      = "bronze_schedules"
+full_test_table = f"hooplakehouse.whoop.{TEST_TABLE}"
+schema_hints    = next((s[2] for s in sources if s[1] == TEST_TABLE), None)
+
+if not spark.catalog.tableExists(full_test_table):
+    print(f"⚠  {full_test_table} doesn't exist yet — run the ingestion cell first.")
+else:
+    # Snapshot before
+    before = (
+        spark.table(full_test_table)
+        .select(
+            F.count("*").alias("row_count"),
+            F.countDistinct("_ingestion_timestamp").alias("distinct_ts"),
+            F.min("_ingestion_timestamp").alias("min_ts"),
+            F.max("_ingestion_timestamp").alias("max_ts"),
+        )
+        .collect()[0]
+    )
+    print(f"Before — {before.row_count} rows | {before.distinct_ts} distinct timestamp(s)")
+    print(f"         {before.min_ts}  →  {before.max_ts}")
+
+    # Force re-ingestion (bypasses S3 modification check)
+    ingest_to_bronze(TEST_SOURCE, TEST_TABLE, schema_hints, force=True)
+
+    # Snapshot after
+    after = (
+        spark.table(full_test_table)
+        .select(
+            F.count("*").alias("row_count"),
+            F.countDistinct("_ingestion_timestamp").alias("distinct_ts"),
+            F.min("_ingestion_timestamp").alias("min_ts"),
+            F.max("_ingestion_timestamp").alias("max_ts"),
+        )
+        .collect()[0]
+    )
+    print(f"\nAfter  — {after.row_count} rows | {after.distinct_ts} distinct timestamp(s)")
+    print(f"         {after.min_ts}  →  {after.max_ts}")
+
+    # Assertions
+    assert before.row_count == after.row_count, \
+        f"❌ Row count changed: {before.row_count} → {after.row_count}"
+    assert before.min_ts == after.min_ts and before.max_ts == after.max_ts, \
+        "❌ Timestamps changed — MERGE updated rows it shouldn't have!"
+
+    print(f"\n✓ {after.row_count} rows — all timestamps preserved")
+
+# COMMAND ----------
+
+# DBTITLE 1,Test: unchanged rows preserve timestamps
+# ── Test: verify unchanged rows keep their original timestamps ────────────────
+# Forces re-ingestion against the same source data and asserts that no
+# _ingestion_timestamp values were modified (all rows matched by _row_hash).
+
+TEST_SOURCE     = "schedules"
+TEST_TABLE      = "bronze_schedules"
+full_test_table = f"hooplakehouse.whoop.{TEST_TABLE}"
+schema_hints    = next((s[2] for s in sources if s[1] == TEST_TABLE), None)
+
+if not spark.catalog.tableExists(full_test_table):
+    print(f"⚠  {full_test_table} doesn't exist yet — run the ingestion cell first.")
+else:
+    # Snapshot before
+    before = (
+        spark.table(full_test_table)
+        .select(
+            F.count("*").alias("row_count"),
+            F.countDistinct("_ingestion_timestamp").alias("distinct_ts"),
+            F.min("_ingestion_timestamp").alias("min_ts"),
+            F.max("_ingestion_timestamp").alias("max_ts"),
+        )
+        .collect()[0]
+    )
+    print(f"Before — {before.row_count} rows | {before.distinct_ts} distinct timestamp(s)")
+    print(f"         {before.min_ts}  →  {before.max_ts}")
+
+    # Force re-ingestion (bypasses S3 modification check)
+    ingest_to_bronze(TEST_SOURCE, TEST_TABLE, schema_hints, force=True)
+
+    # Snapshot after
+    after = (
+        spark.table(full_test_table)
+        .select(
+            F.count("*").alias("row_count"),
+            F.countDistinct("_ingestion_timestamp").alias("distinct_ts"),
+            F.min("_ingestion_timestamp").alias("min_ts"),
+            F.max("_ingestion_timestamp").alias("max_ts"),
+        )
+        .collect()[0]
+    )
+    print(f"\nAfter  — {after.row_count} rows | {after.distinct_ts} distinct timestamp(s)")
+    print(f"         {after.min_ts}  →  {after.max_ts}")
+
+    # Assertions
+    assert before.row_count == after.row_count, \
+        f"❌ Row count changed: {before.row_count} → {after.row_count}"
+    assert before.min_ts == after.min_ts and before.max_ts == after.max_ts, \
+        "❌ Timestamps changed — MERGE updated rows it shouldn't have!"
+
+    print(f"\n✓ {after.row_count} rows — all timestamps preserved")
 
 # COMMAND ----------
 
