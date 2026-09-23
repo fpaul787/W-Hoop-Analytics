@@ -75,3 +75,19 @@ silver_play_by_play = silver_play_by_play.dropDuplicates(["id"])
 
 # DBTITLE 1,Drop _row_hash column
 silver_play_by_play = silver_play_by_play.drop("_row_hash")
+
+# COMMAND ----------
+
+# DBTITLE 1,Save silver table
+from delta.tables import DeltaTable
+
+silver_table_name = "hooplakehouse.whoop.silver_pbp"
+
+if spark.catalog.tableExists(silver_table_name):
+    delta_table = DeltaTable.forName(spark, silver_table_name)
+    delta_table.alias("target").merge(
+        silver_play_by_play.alias("source"),
+        "target.id = source.id"
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
+else:
+    silver_play_by_play.write.saveAsTable(silver_table_name)
