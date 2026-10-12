@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # DBTITLE 1,Bronze Ingestion - WNBA Data
 # MAGIC %md
 # MAGIC ## Bronze Ingestion — wehoop WNBA Data
@@ -10,7 +14,8 @@
 # MAGIC * **Batch read** reads all parquet files from each S3 source path.
 # MAGIC * **Hash-based MERGE** replaces `mode("overwrite")`: all business columns are hashed (SHA-256) into `_row_hash`. On each run, unchanged rows keep their original `_ingestion_timestamp` and `_load_date`; only new or changed rows receive the current timestamp.
 # MAGIC * **`overwriteSchema=True`** / `mergeSchema=True` handles schema evolution. A one-time seed overwrites the table to add `_row_hash` if the column is missing (migration from old overwrite pattern).
-# MAGIC * **Ingestion metadata** added to every row: `_ingestion_timestamp`, `_load_date`, and `_row_hash` (SHA-256 fingerprint of all business columns).
+# MAGIC * **Ingestion metadata** added to every row: `_ingestion_timestamp`, `_load_date`, and `_row_hash` (SHA-256 of `to_json(struct(...))` over the business columns, sorted by name, so null positions and separators can't cause collisions).
+# MAGIC * **Hash versioning**: the table property `whoop.row_hash_version` records the hash algorithm. If it differs from `HASH_VERSION`, `_row_hash` is recomputed in place (timestamps kept) before the MERGE.
 # MAGIC * **No checkpoints needed** — since the upstream overwrites the same files, the S3 modification check + MERGE guarantees we always have the latest state.
 # MAGIC
 # MAGIC ### Why not Auto Loader?
@@ -61,6 +66,42 @@ sources = [
 from datetime import datetime, timezone
 from pyspark.sql import functions as F
 from delta.tables import DeltaTable
+
+# Row-hash versioning: bump HASH_VERSION whenever row_hash_expr changes so existing
+# tables get their _row_hash recomputed in place (timestamps preserved) before the next MERGE.
+HASH_VERSION = "2"
+HASH_VERSION_PROP = "whoop.row_hash_version"
+METADATA_COLS = {"_row_hash", "_ingestion_timestamp", "_load_date"}
+
+def row_hash_expr(business_cols: list[str]):
+    """SHA-256 over a JSON serialization of the business columns.
+
+    to_json(struct(...)) keeps the column name next to every value, so nulls can't shift
+    between columns and separators don't need escaping (fixes concat_ws collisions).
+    Columns are sorted so the hash doesn't depend on column order; timestamps are
+    serialized in UTC so the hash doesn't depend on the session time zone.
+    """
+    cols = [F.col(f"`{c}`") for c in sorted(business_cols)]
+    return F.sha2(F.to_json(F.struct(*cols), {"timeZone": "UTC"}), 256)
+
+def get_hash_version(full_table: str) -> str | None:
+    """Read the row-hash version recorded in the table properties (None if never set)."""
+    props = spark.sql(f"DESCRIBE DETAIL {full_table}").select("properties").collect()[0][0] or {}
+    return props.get(HASH_VERSION_PROP)
+
+def set_hash_version(full_table: str):
+    spark.sql(f"ALTER TABLE {full_table} SET TBLPROPERTIES ('{HASH_VERSION_PROP}' = '{HASH_VERSION}')")
+
+def migrate_row_hash(full_table: str):
+    """One-time recompute of _row_hash on an existing table, keeping _ingestion_timestamp / _load_date."""
+    tbl = spark.table(full_table)
+    business_cols = [c for c in tbl.columns if c not in METADATA_COLS]
+    (tbl.withColumn("_row_hash", row_hash_expr(business_cols))
+        .write
+        .mode("overwrite")
+        .saveAsTable(full_table))
+    set_hash_version(full_table)
+    print(f"  ✓ {full_table} _row_hash recomputed (hash v{HASH_VERSION}), timestamps preserved")
 
 def get_s3_last_modified(s3_path: str) -> datetime:
     """Get the most recent modification time of files in an S3 path using dbutils."""
@@ -113,10 +154,10 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
     else:
         df = spark.read.option("mergeSchema", "true").parquet(s3_path)
 
-    # SHA-256 hash
+    # SHA-256 hash over a null-preserving, column-named serialization
     business_cols = df.columns
     df = df.withColumns({
-        "_row_hash": F.sha2(F.concat_ws("\x01", *[F.col(c).cast("string") for c in business_cols]), 256),
+        "_row_hash": row_hash_expr(business_cols),
         "_ingestion_timestamp": F.current_timestamp(),
         "_load_date": F.current_date()
     })
@@ -130,8 +171,14 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
             .mode("overwrite")
             .option("overwriteSchema", "true")
             .saveAsTable(full_table))
+        set_hash_version(full_table)
         print(f"  ✓ {full_table} seeded (initial / migration load)")
         return
+
+    # Hash algorithm changed since this table was written → recompute existing hashes first,
+    # otherwise every row would look new and the MERGE would reset all timestamps.
+    if get_hash_version(full_table) != HASH_VERSION:
+        migrate_row_hash(full_table)
 
     # Hash-based MERGE — three outcomes per row:
     #   MATCHED (hash in both source & target):      row unchanged → do nothing, timestamps preserved
@@ -207,61 +254,3 @@ else:
         "❌ Timestamps changed — MERGE updated rows it shouldn't have!"
 
     print(f"\n✓ {after.row_count} rows — all timestamps preserved")
-
-# COMMAND ----------
-
-# DBTITLE 1,Test: unchanged rows preserve timestamps
-# ── Test: verify unchanged rows keep their original timestamps ────────────────
-# Forces re-ingestion against the same source data and asserts that no
-# _ingestion_timestamp values were modified (all rows matched by _row_hash).
-
-TEST_SOURCE     = "schedules"
-TEST_TABLE      = "bronze_schedules"
-full_test_table = f"hooplakehouse.whoop.{TEST_TABLE}"
-schema_hints    = next((s[2] for s in sources if s[1] == TEST_TABLE), None)
-
-if not spark.catalog.tableExists(full_test_table):
-    print(f"⚠  {full_test_table} doesn't exist yet — run the ingestion cell first.")
-else:
-    # Snapshot before
-    before = (
-        spark.table(full_test_table)
-        .select(
-            F.count("*").alias("row_count"),
-            F.countDistinct("_ingestion_timestamp").alias("distinct_ts"),
-            F.min("_ingestion_timestamp").alias("min_ts"),
-            F.max("_ingestion_timestamp").alias("max_ts"),
-        )
-        .collect()[0]
-    )
-    print(f"Before — {before.row_count} rows | {before.distinct_ts} distinct timestamp(s)")
-    print(f"         {before.min_ts}  →  {before.max_ts}")
-
-    # Force re-ingestion (bypasses S3 modification check)
-    ingest_to_bronze(TEST_SOURCE, TEST_TABLE, schema_hints, force=True)
-
-    # Snapshot after
-    after = (
-        spark.table(full_test_table)
-        .select(
-            F.count("*").alias("row_count"),
-            F.countDistinct("_ingestion_timestamp").alias("distinct_ts"),
-            F.min("_ingestion_timestamp").alias("min_ts"),
-            F.max("_ingestion_timestamp").alias("max_ts"),
-        )
-        .collect()[0]
-    )
-    print(f"\nAfter  — {after.row_count} rows | {after.distinct_ts} distinct timestamp(s)")
-    print(f"         {after.min_ts}  →  {after.max_ts}")
-
-    # Assertions
-    assert before.row_count == after.row_count, \
-        f"❌ Row count changed: {before.row_count} → {after.row_count}"
-    assert before.min_ts == after.min_ts and before.max_ts == after.max_ts, \
-        "❌ Timestamps changed — MERGE updated rows it shouldn't have!"
-
-    print(f"\n✓ {after.row_count} rows — all timestamps preserved")
-
-# COMMAND ----------
-
-
