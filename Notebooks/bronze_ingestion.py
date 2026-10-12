@@ -195,6 +195,7 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
     (DeltaTable.forName(spark, full_table)
         .alias("target")
         .merge(df.alias("source"), "target._row_hash = source._row_hash")
+        .withSchemaEvolution()
         .whenNotMatchedInsertAll()
         .whenNotMatchedBySourceDelete()
         .execute()
