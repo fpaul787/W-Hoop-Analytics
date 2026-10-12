@@ -1,13 +1,4 @@
 # Databricks notebook source
-# /// script
-# [tool.databricks.environment]
-# environment_version = "5"
-# ///
-# MAGIC %sql
-# MAGIC SELECT * FROM hooplakehouse.whoop.bronze_pbp;
-
-# COMMAND ----------
-
 # MAGIC %md
 # MAGIC # Initial Silver Layer Goals
 # MAGIC * Enforce Consistent Schema
