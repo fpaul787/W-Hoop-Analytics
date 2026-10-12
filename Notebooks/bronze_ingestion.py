@@ -122,13 +122,16 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
     s3_path = f"s3://{bucket_name}/{folder}/{source_subfolder}/parquet/"
     full_table = f"hooplakehouse.whoop.{table_name}"
 
-    # Check if source files have been modified since last ingestion
-    s3_modified = get_s3_last_modified(s3_path)
-    last_ingestion = get_last_ingestion(full_table)
+    table_exists = spark.catalog.tableExists(full_table)
+    needs_seed = not table_exists or "_row_hash" not in spark.table(full_table).columns
 
-    if not force and last_ingestion and s3_modified <= last_ingestion.replace(tzinfo=timezone.utc):
-        print(f"Skipping {full_table} — source unchanged (last modified: {s3_modified})")
-        return
+    # Only skip tables that already have _row_hash and whose source hasn't changed
+    s3_modified = get_s3_last_modified(s3_path)
+    if not force and not needs_seed:
+        last_ingestion = get_last_ingestion(full_table)
+        if last_ingestion and s3_modified <= last_ingestion.replace(tzinfo=timezone.utc):
+            print(f"Skipping {full_table} — source unchanged (last modified: {s3_modified})")
+            return
 
     print(f"Ingesting: {s3_path} → {full_table}")
 
@@ -163,9 +166,6 @@ def ingest_to_bronze(source_subfolder: str, table_name: str, schema_hints: str |
     })
 
     # First load or migration: table missing _row_hash → seed with a full overwrite
-    table_exists = spark.catalog.tableExists(full_table)
-    needs_seed = not table_exists or "_row_hash" not in spark.table(full_table).columns  # listColumns() silently returns empty for UC 3-part names
-
     if needs_seed:
         (df.write
             .mode("overwrite")
