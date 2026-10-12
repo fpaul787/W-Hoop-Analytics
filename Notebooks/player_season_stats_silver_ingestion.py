@@ -1,4 +1,8 @@
 # Databricks notebook source
+# /// script
+# [tool.databricks.environment]
+# environment_version = "6"
+# ///
 # DBTITLE 1,Silver Ingestion - Player Season Stats
 # MAGIC %md
 # MAGIC # Silver Ingestion — Player Season Stats
@@ -8,7 +12,7 @@
 # MAGIC * Null filtering on composite primary key (`season`, `athlete_id`, `team_id`, `stat_name`)
 # MAGIC * Deduplication by primary key
 # MAGIC * Drop internal `_row_hash` column
-# MAGIC * MERGE upsert into `hooplakehouse.whoop.silver_player_season_stats`
+# MAGIC * MERGE upsert into `hooplakehouse.whoop.silver_player_season_stats`, deleting rows no longer in bronze (aborts if source is empty or >5% of rows would be deleted)
 
 # COMMAND ----------
 
@@ -65,13 +69,30 @@ merge_condition = (
     "AND target.stat_name = source.stat_name"
 )
 
+pk_cols = ["season", "athlete_id", "team_id", "stat_name"]
+MAX_DELETE_FRACTION = 0.05  # abort if more than 5% of silver rows would be deleted
+
 if spark.catalog.tableExists(silver_table):
+    # Guard: bronze is a complete snapshot, so rows missing from it are deleted from silver.
+    # Refuse to run if the source is empty or the delete volume looks like a bad bronze load.
+    source_count = silver_df.count()
+    if source_count == 0:
+        raise ValueError(f"Aborting: source for {silver_table} is empty — refusing to delete all silver rows")
+    target_pks = spark.table(silver_table).select(*pk_cols)
+    target_count = target_pks.count()
+    delete_count = target_pks.join(silver_df.select(*pk_cols), pk_cols, "left_anti").count()
+    if target_count and delete_count / target_count > MAX_DELETE_FRACTION:
+        raise ValueError(
+            f"Aborting: {delete_count:,} of {target_count:,} rows ({delete_count / target_count:.1%}) in "
+            f"{silver_table} would be deleted — exceeds {MAX_DELETE_FRACTION:.0%}. Check bronze before re-running."
+        )
+
     delta_table = DeltaTable.forName(spark, silver_table)
     delta_table.alias("target").merge(
         silver_df.alias("source"),
         merge_condition
-    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().execute()
-    print(f"✓ Merged into {silver_table}")
+    ).whenMatchedUpdateAll().whenNotMatchedInsertAll().whenNotMatchedBySourceDelete().execute()
+    print(f"✓ Merged into {silver_table} — {source_count:,} source rows, {delete_count:,} removed upstream and deleted")
 else:
     silver_df.write.saveAsTable(silver_table)
     print(f"✓ Created {silver_table}")
