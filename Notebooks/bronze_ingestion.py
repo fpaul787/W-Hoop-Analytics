@@ -31,6 +31,9 @@
 # MAGIC | Schedules | `s3://wehoop/wehoop-wnba-data/schedules/parquet/` | `hooplakehouse.whoop.bronze_schedules` |
 # MAGIC | Team Box | `s3://wehoop/wehoop-wnba-data/team_box/parquet/` | `hooplakehouse.whoop.bronze_team_box` |
 # MAGIC
+# MAGIC ### Validation test
+# MAGIC The timestamp-preservation test (last cell) forces a re-ingest of `bronze_schedules`, so it only runs when the `run_tests` parameter is `true` (default `false`). Set it from the widget, or pass `run_tests=true` as a job parameter for a dedicated test run.
+# MAGIC
 # MAGIC ### Adding a new source
 # MAGIC Append a tuple to the `sources` list in the ingestion cell: `("subfolder_name", "bronze_table_name")`
 
@@ -47,6 +50,11 @@ from pyspark.sql.functions import current_timestamp, current_date
 
 bucket_name = "wehoop"
 folder = "wehoop-wnba-data"
+
+# Test parameter: validation cells only run when run_tests = "true".
+# Defaults to "false" so scheduled production runs never force extra writes.
+dbutils.widgets.dropdown("run_tests", "false", ["false", "true"], "Run validation tests")
+RUN_TESTS = dbutils.widgets.get("run_tests").lower() == "true"
 
 # COMMAND ----------
 
@@ -207,13 +215,16 @@ for source_subfolder, table_name, schema_hints in sources:
 # ── Test: verify unchanged rows keep their original timestamps ────────────────
 # Forces re-ingestion against the same source data and asserts that no
 # _ingestion_timestamp values were modified (all rows matched by _row_hash).
+# Gated behind the run_tests parameter (Configuration cell) so production runs skip it.
 
 TEST_SOURCE     = "schedules"
 TEST_TABLE      = "bronze_schedules"
 full_test_table = f"hooplakehouse.whoop.{TEST_TABLE}"
 schema_hints    = next((s[2] for s in sources if s[1] == TEST_TABLE), None)
 
-if not spark.catalog.tableExists(full_test_table):
+if not RUN_TESTS:
+    print("Skipping validation test — set run_tests = 'true' to run it.")
+elif not spark.catalog.tableExists(full_test_table):
     print(f"⚠  {full_test_table} doesn't exist yet — run the ingestion cell first.")
 else:
     # Snapshot before
